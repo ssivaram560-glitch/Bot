@@ -1,776 +1,635 @@
 const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
-const crypto = require('crypto');
+const axios       = require('axios');
+const crypto      = require('crypto');
+const zlib        = require('zlib');
 
-// ===== 1. CONFIGURATION =====
-const TOKEN        = "8692459169:AAGlQsbCDcva-r_b89xPA9QuiGzgWDjX2h4";
+// ============================================================
+//  CONFIG
+// ============================================================
+const BOT_TOKEN    = "8692459169:AAGlQsbCDcva-r_b89xPA9QuiGzgWDjX2h4";
 const OWNER_ID     = 8321379592;
 const OWNER_PASS   = "suthamari6381";
 const ADMIN_HANDLE = "@Tamilan12345678";
 const REG_LINK     = "https://www.goaoko.com/#/register?invitationCode=457367799017";
-
 const WIN_STICKER  = "CAACAgUAAxkBAAFHUGNp4JX1-ohP4uBEWpfNptaz-HmwVgAC4hgAAhboKVbObuGuTcMs2zsE";
 const LOSS_STICKER = "CAACAgUAAxkBAAFHUGVp4JX-BE2TRkhIKTwcjkwW-gzdPAACthoAAoG8YVYiydObSa0O8zsE";
 
-let AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOiIxNzc4MjIyOTUwIn0.placeholder";
+// ============================================================
+//  STORAGE
+// ============================================================
+let ownerLoggedIn  = false;
+let adminPasswords = {};   // { userId: "password" }
+let adminLoggedIn  = {};   // { userId: true/false }
+let usersAccess    = {};   // { userId: expiryTimestamp }
+let keyStore       = {};   // { "KING-XXX": { days, used, usedBy } }
+let stats          = {};   // { userId: { total, win, loss, ... } }
+let running        = {};   // { userId: true/false }
+let sentPeriods    = {};   // { userId: Set<period> }
+let ownerState     = null; // current owner input state
+let adminState     = {};   // { userId: state }
 
-// ===== 2. DATA STORAGE =====
-let ownerLoggedIn  = false;             // owner session
-let admins         = {};                // { adminId: { password, loggedIn, name } }
-let adminPasswords = {};                // { adminId: "password" }
-let adminLoggedIn  = {};                // { adminId: true/false }
-let usersAccess    = {};                // { userId: expiryTimestamp }
-let stats          = {};                // per-user stats
-let running        = {};                // prediction loop active
-let sentPeriods    = {};                // duplicate prevention
-let keyStore       = {};                // { "KING-XXXX": { days, used, usedBy, createdAt, createdByAdmin } }
+// ============================================================
+//  HELPERS
+// ============================================================
+function initUser(id) {
+    if (!stats[id])       stats[id]       = { total:0, win:0, loss:0, lossStreak:0, winStreak:0, maxWinStreak:0, maxLossStreak:0 };
+    if (!sentPeriods[id]) sentPeriods[id] = new Set();
+}
+function hasAccess(id)  { return !!(usersAccess[id] && Date.now() < usersAccess[id]); }
+function daysLeft(id)   { return usersAccess[id] ? ((usersAccess[id]-Date.now())/86400000).toFixed(1) : "0"; }
+function isAdmin(id)    { return adminPasswords[id] !== undefined; }
+function isAdminIn(id)  { return adminLoggedIn[id] === true; }
+function sleep(ms)      { return new Promise(r => setTimeout(r, ms)); }
 
-// State machines
-let ownerState     = {};
-let adminStateMap  = {};
-let tempState      = {};
-
-// ===== 3. HELPER FUNCTIONS =====
-function initUser(userId) {
-    if (!stats[userId]) {
-        stats[userId] = { total:0, win:0, loss:0, lossStreak:0, winStreak:0, maxWinStreak:0, maxLossStreak:0 };
-    }
-    if (!sentPeriods[userId]) sentPeriods[userId] = new Set();
+function generateKey(days, byAdmin) {
+    const k = "KING-" + crypto.randomBytes(3).toString('hex').toUpperCase() + "-" + crypto.randomBytes(2).toString('hex').toUpperCase();
+    keyStore[k] = { days, used:false, usedBy:null, by: byAdmin||OWNER_ID };
+    return k;
 }
 
-function hasAccess(userId) {
-    return usersAccess[userId] && Date.now() < usersAccess[userId];
-}
-
-function daysLeft(userId) {
-    if (!usersAccess[userId]) return "0";
-    return ((usersAccess[userId] - Date.now()) / 86400000).toFixed(1);
-}
-
-function isAdmin(userId) {
-    return adminPasswords[userId] !== undefined;
-}
-
-function isAdminLoggedIn(userId) {
-    return adminLoggedIn[userId] === true;
-}
-
-function isOwner(userId) {
-    return userId === OWNER_ID;
-}
-
-function isOwnerLoggedIn() {
-    return ownerLoggedIn;
-}
-
-// Generate key
-function generateKey(days, adminId) {
-    const key = "KING-" + crypto.randomBytes(3).toString('hex').toUpperCase() + "-" + crypto.randomBytes(2).toString('hex').toUpperCase();
-    keyStore[key] = { days, used: false, usedBy: null, createdAt: Date.now(), createdByAdmin: adminId || OWNER_ID };
-    return key;
-}
-
-// Activate key
-function activateKey(userId, keyCode) {
-    const key = keyCode.toUpperCase().trim();
-    if (!keyStore[key])        return { ok: false, reason: "Invalid key! Check and try again." };
-    if (keyStore[key].used)    return { ok: false, reason: "This key is already used!" };
-    const days = keyStore[key].days;
-    keyStore[key].used   = true;
-    keyStore[key].usedBy = userId;
+function activateKey(userId, code) {
+    const k = code.toUpperCase().trim();
+    if (!keyStore[k])        return { ok:false, msg:"❌ Invalid key! Check and try again." };
+    if (keyStore[k].used)    return { ok:false, msg:"❌ Key already used by someone!" };
+    const days = keyStore[k].days;
+    keyStore[k].used   = true;
+    keyStore[k].usedBy = userId;
     const base = (usersAccess[userId] && usersAccess[userId] > Date.now()) ? usersAccess[userId] : Date.now();
-    usersAccess[userId]  = base + days * 86400000;
-    return { ok: true, days, expiry: new Date(usersAccess[userId]).toLocaleString() };
+    usersAccess[userId] = base + days * 86400000;
+    return { ok:true, days, expiry: new Date(usersAccess[userId]).toLocaleString() };
 }
 
-function listActiveUsers() {
-    const now = Date.now();
-    const list = Object.entries(usersAccess).filter(([,exp]) => exp > now);
+function activeUsersList() {
+    const now  = Date.now();
+    const list = Object.entries(usersAccess).filter(([,e]) => e > now);
     if (!list.length) return "No active users.";
-    return list.map(([id, exp]) => {
-        const d = ((exp - now)/86400000).toFixed(1);
-        return "ID: " + id + " | " + d + " days left";
-    }).join("\n");
+    return list.map(([id,e]) => "ID: " + id + " | " + ((e-now)/86400000).toFixed(1) + " days").join("\n");
 }
-
-function listAdmins() {
+function adminList() {
     const ids = Object.keys(adminPasswords);
-    if (!ids.length) return "No admins added.";
-    return ids.map(id => {
-        const status = adminLoggedIn[id] ? "Online" : "Offline";
-        return "Admin ID: " + id + " | " + status;
-    }).join("\n");
+    if (!ids.length) return "No admins.";
+    return ids.map(id => "ID: " + id + " | " + (adminLoggedIn[id] ? "Online" : "Offline")).join("\n");
 }
-
-function listAllKeys() {
+function allKeysList() {
     const keys = Object.entries(keyStore);
     if (!keys.length) return "No keys yet.";
-    return keys.map(([k, v]) => {
-        const status = v.used ? "Used by " + v.usedBy : "Available (" + v.days + "d)";
-        return k + " - " + status;
-    }).join("\n");
+    return keys.map(([k,v]) => k + " - " + (v.used ? "Used" : v.days + "d Available")).join("\n");
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// ===== 4. BOT INIT =====
-let bot;
-function createBot() {
-    if (bot) { try { bot.stopPolling(); } catch(e){} }
-    bot = new TelegramBot(TOKEN, {
-        polling: { interval: 1000, autoStart: true, params: { timeout: 30 } }
-    });
-    bot.on("polling_error", (err) => {
-        console.error("Polling error:", err.code, err.message);
-        setTimeout(createBot, 5000);
-    });
-    bot.on("error", (err) => { console.error("Bot error:", err.message); });
-    registerHandlers();
-    console.log("Bot started.");
-}
-
-// ===== 5. KEYBOARDS =====
-function getMenu(userId) {
+// ============================================================
+//  KEYBOARDS
+// ============================================================
+function userMenu(id) {
     const rows = [
         ["▶️ Start Prediction"],
         ["📊 Result", "📩 Contact"],
         ["🛑 Stop Bot"]
     ];
-    if (isAdmin(userId) && !isOwner(userId)) {
-        rows.push(["👑 Admin Panel"]);
-    }
+    if (isAdmin(id)) rows.push(["👑 Admin Panel"]);
     return { keyboard: rows, resize_keyboard: true };
 }
 
-function getAdminMenu() {
-    return {
-        keyboard: [
-            ["👥 Active Users", "🔑 Generate Key"],
-            ["🟢 Add User", "🔴 Remove User"],
-            ["📋 All Keys", "🚪 Admin Logout"]
-        ],
-        resize_keyboard: true
-    };
+const ownerMenu = {
+    keyboard: [
+        ["👥 All Users",    "👮 All Admins"],
+        ["👤 Add Admin",    "🗑 Remove Admin"],
+        ["🔑 Generate Key", "📋 All Keys"],
+        ["🟢 Add User",     "🔴 Remove User"],
+        ["🔐 Set Token",    "🚪 Owner Logout"]
+    ],
+    resize_keyboard: true
+};
+
+const adminMenu = {
+    keyboard: [
+        ["👥 Active Users", "🔑 Generate Key"],
+        ["🟢 Add User",     "🔴 Remove User"],
+        ["📋 All Keys",     "🚪 Admin Logout"]
+    ],
+    resize_keyboard: true
+};
+
+// ============================================================
+//  BOT
+// ============================================================
+let bot;
+function startBot() {
+    if (bot) { try { bot.stopPolling(); } catch(e){} }
+    bot = new TelegramBot(BOT_TOKEN, {
+        polling: { interval: 1000, autoStart: true, params: { timeout: 30 } }
+    });
+    bot.on("polling_error", err => { console.error("Poll error:", err.message); setTimeout(startBot, 5000); });
+    bot.on("error",         err => { console.error("Bot error:",  err.message); });
+    addHandlers();
+    console.log("Bot running...");
 }
 
-function getOwnerMenu() {
-    return {
-        keyboard: [
-            ["👥 All Users", "👮 All Admins"],
-            ["👤 Add Admin", "🗑 Remove Admin"],
-            ["🔑 Generate Key", "📋 All Keys"],
-            ["🟢 Add User", "🔴 Remove User"],
-            ["🔐 Set Token", "🚪 Owner Logout"]
-        ],
-        resize_keyboard: true
-    };
-}
-
-// ===== 6. SAFE SEND — NO MARKDOWN to avoid parse errors =====
-async function safeSend(chatId, text, opts = {}) {
+// ============================================================
+//  SAFE SEND
+// ============================================================
+async function send(chatId, text, opts={}) {
     try {
         return await bot.sendMessage(chatId, text, opts);
     } catch(e) {
-        // Retry without parse_mode if markdown error
+        // retry without parse_mode if markdown error
         if (e.message && e.message.includes("parse entities")) {
             try {
-                const safeOpts = Object.assign({}, opts);
-                delete safeOpts.parse_mode;
-                return await bot.sendMessage(chatId, text, safeOpts);
-            } catch(e2) { console.error("sendMessage retry failed:", e2.message); }
-        } else {
-            console.error("sendMessage:", e.message);
-        }
+                const o = {...opts}; delete o.parse_mode;
+                return await bot.sendMessage(chatId, text, o);
+            } catch(e2) { console.error("send failed:", e2.message); }
+        } else { console.error("send error:", e.message); }
     }
 }
-async function safeSticker(chatId, sid) {
-    try { return await bot.sendSticker(chatId, sid); }
-    catch(e) { console.error("sendSticker:", e.message); }
+async function sendSticker(chatId, sid) {
+    try { await bot.sendSticker(chatId, sid); } catch(e) { console.error("sticker err:", e.message); }
 }
 
-// ===== 7. FETCH DATA =====
-async function fetchData(retries = 3) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            // No token needed — works without auth
-            const headers = {
-                "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
-                "Origin": "https://bdgwinseo.com",
-                "Referer": "https://bdgwinseo.com/",
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "cross-site"
-            };
+// ============================================================
+//  API FETCH  — tries multiple decode methods
+// ============================================================
+const API_HEADERS = {
+    "User-Agent":       "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
+    "Accept":           "application/json, text/plain, */*",
+    "Accept-Encoding":  "gzip, deflate, br",
+    "Accept-Language":  "en-GB,en-US;q=0.9,en;q=0.8",
+    "Origin":           "https://bdgwinseo.com",
+    "Referer":          "https://bdgwinseo.com/",
+    "Sec-Fetch-Dest":   "empty",
+    "Sec-Fetch-Mode":   "cors",
+    "Sec-Fetch-Site":   "cross-site"
+};
 
+function decodeBuffer(buf) {
+    // 1. Direct UTF-8
+    try { return JSON.parse(buf.toString("utf8")); } catch(e) {}
+    // 2. gunzip
+    try { return JSON.parse(zlib.gunzipSync(buf).toString("utf8")); } catch(e) {}
+    // 3. inflate
+    try { return JSON.parse(zlib.inflateSync(buf).toString("utf8")); } catch(e) {}
+    // 4. inflateRaw
+    try { return JSON.parse(zlib.inflateRawSync(buf).toString("utf8")); } catch(e) {}
+    // 5. brotli
+    try { return JSON.parse(zlib.brotliDecompressSync(buf).toString("utf8")); } catch(e) {}
+    return null;
+}
+
+async function fetchList(retries=3) {
+    for (let i=0; i<retries; i++) {
+        try {
             const res = await axios.get(
                 "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts=" + Date.now(),
-                { headers, timeout: 10000, decompress: true, responseType: "arraybuffer" }
+                { headers: API_HEADERS, timeout: 10000, decompress: true, responseType: "arraybuffer" }
             );
-
-            // octet-stream response — try multiple decode methods
-            let data;
-            const buf = Buffer.from(res.data);
-            
-            // Method 1: Direct UTF-8
-            try { data = JSON.parse(buf.toString("utf8")); } catch(e) {}
-            
-            // Method 2: zlib inflate
-            if (!data) {
-                try {
-                    const zlib = require("zlib");
-                    const inflated = zlib.inflateSync(buf);
-                    data = JSON.parse(inflated.toString("utf8"));
-                } catch(e) {}
-            }
-            
-            // Method 3: zlib inflateRaw
-            if (!data) {
-                try {
-                    const zlib = require("zlib");
-                    const inflated = zlib.inflateRawSync(buf);
-                    data = JSON.parse(inflated.toString("utf8"));
-                } catch(e) {}
-            }
-
-            // Method 4: gunzip
-            if (!data) {
-                try {
-                    const zlib = require("zlib");
-                    const inflated = zlib.gunzipSync(buf);
-                    data = JSON.parse(inflated.toString("utf8"));
-                } catch(e) {}
-            }
-
-            if (!data) {
-                console.error("All decode methods failed. Raw hex:", buf.slice(0,20).toString("hex"));
-                continue;
-            }
-
-            const list = data && data.data && data.data.list;
+            const buf  = Buffer.from(res.data);
+            const data = decodeBuffer(buf);
+            if (!data) { console.error("Decode failed. Hex:", buf.slice(0,20).toString("hex")); continue; }
+            const list = data?.data?.list;
             if (list && list.length > 0) return list;
-
-            console.log("API response:", JSON.stringify(data).slice(0, 300));
+            console.error("API returned no list:", JSON.stringify(data).slice(0,200));
         } catch(e) {
-            console.error("Fetch attempt " + (i+1) + " failed:", e.message);
-            if (i < retries - 1) await sleep(3000);
+            console.error("Fetch attempt", i+1, "failed:", e.message);
+            if (i < retries-1) await sleep(3000);
         }
     }
     return null;
 }
 
-// ===== 8. PREDICTION =====
-function getLevelInfo(lossStreak) {
-    const level  = Math.min(lossStreak + 1, 5);
-    const stars  = "★".repeat(level) + "☆".repeat(5 - level);
-    const labels = ["", "LEVEL 1 SURE", "LEVEL 2 SURE", "LEVEL 3 SURE", "LEVEL 4 SURE", "LEVEL 5 SURE"];
-    return { level, stars, label: labels[level] };
+// ============================================================
+//  PREDICTION LOGIC
+// ============================================================
+function levelInfo(lossStreak) {
+    const lvl    = Math.min(lossStreak+1, 5);
+    const stars  = "⭐".repeat(lvl) + "☆".repeat(5-lvl);
+    const labels = ["","LEVEL 1 SURE","LEVEL 2 SURE","LEVEL 3 SURE","LEVEL 4 SURE","LEVEL 5 SURE 🔱"];
+    return { lvl, stars, label: labels[lvl] };
 }
 
-function predict(list, userStats) {
-    const results = list.slice(0, 10).map(i => parseInt(i.number) >= 5 ? "BIG" : "SMALL");
-    const last5   = results.slice(0, 5);
-    const last10  = results.slice(0, 10);
-    const big5    = last5.filter(x => x === "BIG").length;
-    const big10   = last10.filter(x => x === "BIG").length;
+function predict(list, s) {
+    const r    = list.slice(0,10).map(i => parseInt(i.number)>=5 ? "BIG" : "SMALL");
+    const l5   = r.slice(0,5);
+    const l10  = r.slice(0,10);
+    const big5 = l5.filter(x=>x==="BIG").length;
+    const big10= l10.filter(x=>x==="BIG").length;
+    let p = big5>=3 ? "BIG" : "SMALL";
 
-    let pred = big5 >= 3 ? "BIG" : "SMALL";
+    // streak reversal
+    let streak=1;
+    for (let i=1;i<l5.length;i++) { if(l5[i]===l5[0]) streak++; else break; }
+    if (streak>=3) p = l5[0]==="BIG" ? "SMALL" : "BIG";
 
-    let streak = 1;
-    for (let i = 1; i < last5.length; i++) {
-        if (last5[i] === last5[0]) streak++; else break;
-    }
-    if (streak >= 3) pred = last5[0] === "BIG" ? "SMALL" : "BIG";
-
-    const ls = userStats.lossStreak;
-    if (ls === 1) pred = big10 >= 5 ? "BIG" : "SMALL";
-    if (ls === 2) pred = last5[0] === "BIG" ? "SMALL" : "BIG";
-    if (ls === 3) pred = big5 >= 3 ? "BIG" : "SMALL";
-    if (ls >= 4)  pred = big10 >= 6 ? "BIG" : "SMALL";
-
-    return pred;
+    // loss recovery
+    const ls = s.lossStreak;
+    if (ls===1) p = big10>=5 ? "BIG":"SMALL";
+    if (ls===2) p = l5[0]==="BIG" ? "SMALL":"BIG";
+    if (ls===3) p = big5>=3 ? "BIG":"SMALL";
+    if (ls>=4)  p = big10>=6 ? "BIG":"SMALL";
+    return p;
 }
 
-// ===== 9. PREDICT LOOP =====
+function signalMsg(period, pred, lvl) {
+    const arrow = pred==="BIG" ? "🔴" : "🔵";
+    return (
+        "📊 AR-LOTTERY SIGNAL\n" +
+        "═══════════════════════\n" +
+        "📅 Period : " + period + "\n" +
+        "🎯 Predict: " + arrow + " " + pred + "\n" +
+        "📈 Signal : " + lvl.label + "\n" +
+        "⭐ Level  : " + lvl.stars + "\n" +
+        "═══════════════════════\n" +
+        "⚡ Place your bet NOW!"
+    );
+}
+
+// ============================================================
+//  PREDICTION LOOP
+// ============================================================
 async function runPredict(userId, chatId) {
     if (!running[userId]) return;
 
-    const list = await fetchData();
+    const list = await fetchList();
     if (!list) {
-        await safeSend(chatId, "⚠️ API error, retrying in 10s...");
+        await send(chatId, "⚠️ API error, retrying in 10s...");
         return setTimeout(() => runPredict(userId, chatId), 10000);
     }
 
-    const nextPeriod = (BigInt(list[0].issueNumber) + 1n).toString();
+    const next = (BigInt(list[0].issueNumber)+1n).toString();
 
+    // duplicate guard
     if (!sentPeriods[userId]) sentPeriods[userId] = new Set();
-    if (sentPeriods[userId].has(nextPeriod)) {
+    if (sentPeriods[userId].has(next)) {
         return setTimeout(() => runPredict(userId, chatId), 5000);
     }
-    sentPeriods[userId].add(nextPeriod);
+    sentPeriods[userId].add(next);
     if (sentPeriods[userId].size > 20) {
-        const arr = [...sentPeriods[userId]];
-        sentPeriods[userId] = new Set(arr.slice(-20));
+        sentPeriods[userId] = new Set([...sentPeriods[userId]].slice(-20));
     }
 
     const pred = predict(list, stats[userId]);
-    const lvl  = getLevelInfo(stats[userId].lossStreak);
-    const emoji = pred === "BIG" ? "🔴" : "🔵";
-    const arrow = pred === "BIG" ? "BIG" : "SMALL";
-    const msg = (
-        "📊 AR-LOTTERY SIGNAL\n" +
-        "〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n" +
-        "📅 Period : " + nextPeriod + "\n" +
-        "🎯 Predict: " + emoji + " " + arrow + "\n" +
-        "📈 Signal : " + lvl.label + "\n" +
-        "⭐ Level  : " + lvl.stars + "\n" +
-        "〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n" +
-        "⚡ Place your bet NOW!"
-    );
+    const lvl  = levelInfo(stats[userId].lossStreak);
 
-    await safeSend(chatId, msg, {
-        reply_markup: {
-            inline_keyboard: [[{ text: "BET NOW - GOAOKO", url: REG_LINK }]]
-        }
+    await send(chatId, signalMsg(next, pred, lvl), {
+        reply_markup: { inline_keyboard: [[{ text:"💰 BET NOW - GOAOKO", url: REG_LINK }]] }
     });
 
-    checkResult(userId, chatId, nextPeriod, pred);
+    checkResult(userId, chatId, next, pred);
 }
 
-// ===== 10. RESULT CHECKER =====
-async function checkResult(userId, chatId, targetPeriod, predicted) {
-    let attempts = 0;
-    const iv = setInterval(async () => {
+async function checkResult(userId, chatId, target, predicted) {
+    let tries = 0;
+    const iv  = setInterval(async () => {
         if (!running[userId]) return clearInterval(iv);
-        if (++attempts > 18) {
+        if (++tries > 18) {
             clearInterval(iv);
-            await safeSend(chatId, "⏱ Result timeout - moving to next period.");
+            await send(chatId, "⏱ Timeout — next period...");
             setTimeout(() => { if (running[userId]) runPredict(userId, chatId); }, 3000);
             return;
         }
-        const list = await fetchData();
+        const list = await fetchList();
         if (!list) return;
-        if (BigInt(list[0].issueNumber) < BigInt(targetPeriod)) return;
+        if (BigInt(list[0].issueNumber) < BigInt(target)) return;
 
         clearInterval(iv);
-        const resData   = list.find(i => i.issueNumber === targetPeriod) || list[0];
-        const actualNum = parseInt(resData.number);
-        const actual    = actualNum >= 5 ? "BIG" : "SMALL";
-        const win       = predicted === actual;
-        const s         = stats[userId];
-
+        const res    = list.find(i=>i.issueNumber===target) || list[0];
+        const num    = parseInt(res.number);
+        const actual = num>=5 ? "BIG":"SMALL";
+        const win    = predicted===actual;
+        const s      = stats[userId];
         s.total++;
+
         if (win) {
-            s.win++; s.winStreak++; s.lossStreak = 0;
-            if (s.winStreak > s.maxWinStreak) s.maxWinStreak = s.winStreak;
-            await safeSend(chatId, "✅ WIN! 🎉\n🔢 Number: " + actualNum + " ➡️ " + actual + "\n🔥 Win Streak: " + s.winStreak + "\n💰 Keep Betting!");
-            await safeSticker(chatId, WIN_STICKER);
+            s.win++; s.winStreak++; s.lossStreak=0;
+            if (s.winStreak>s.maxWinStreak) s.maxWinStreak=s.winStreak;
+            await send(chatId, "✅ WIN! 🎉\n🔢 Number: " + num + " → " + actual + "\n🔥 Win Streak: " + s.winStreak);
+            await sendSticker(chatId, WIN_STICKER);
         } else {
-            s.loss++; s.lossStreak++; s.winStreak = 0;
-            if (s.lossStreak > s.maxLossStreak) s.maxLossStreak = s.lossStreak;
-            const next = getLevelInfo(s.lossStreak);
-            await safeSend(chatId, "❌ LOSS\n🔢 Number: " + actualNum + " ➡️ " + actual + "\n⚠️ Next Signal: " + next.label + " " + next.stars + "\n💪 Stay Strong!");
-            await safeSticker(chatId, LOSS_STICKER);
+            s.loss++; s.lossStreak++; s.winStreak=0;
+            if (s.lossStreak>s.maxLossStreak) s.maxLossStreak=s.lossStreak;
+            const next = levelInfo(s.lossStreak);
+            await send(chatId, "❌ LOSS\n🔢 Number: " + num + " → " + actual + "\n⚠️ Next: " + next.label + " " + next.stars);
+            await sendSticker(chatId, LOSS_STICKER);
         }
         setTimeout(() => { if (running[userId]) runPredict(userId, chatId); }, 8000);
     }, 10000);
 }
 
-// ===== 11. STATS =====
-function showStats(msg) {
-    const d    = stats[msg.from.id];
-    const rate = d.total ? ((d.win / d.total) * 100).toFixed(1) : "0.0";
-    const fill = d.total ? Math.round(d.win / d.total * 10) : 0;
-    const bar  = "W".repeat(fill) + "L".repeat(10 - fill);
-    safeSend(msg.chat.id,
+// ============================================================
+//  STATS
+// ============================================================
+function showStats(chatId, userId) {
+    const d    = stats[userId];
+    const rate = d.total ? ((d.win/d.total)*100).toFixed(1) : "0.0";
+    const fill = d.total ? Math.round(d.win/d.total*10) : 0;
+    const bar  = "🟩".repeat(fill) + "🟥".repeat(10-fill);
+    send(chatId,
         "📊 PERFORMANCE REPORT\n" +
-        "〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n" +
+        "═══════════════════════\n" +
         "🔮 Total    : " + d.total + "\n" +
-        "✅ Wins     : " + d.win + "\n" +
-        "❌ Losses   : " + d.loss + "\n" +
+        "✅ Wins     : " + d.win   + "\n" +
+        "❌ Losses   : " + d.loss  + "\n" +
         "📈 Accuracy : " + rate + "%\n" +
-        "[" + bar + "]\n" +
-        "〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n" +
+        bar + "\n" +
+        "═══════════════════════\n" +
         "🔥 Best Win Streak  : " + d.maxWinStreak + "\n" +
         "💀 Worst Loss Streak: " + d.maxLossStreak
     );
 }
 
-// ===== 12. HANDLERS =====
-function registerHandlers() {
+// ============================================================
+//  HANDLERS
+// ============================================================
+function addHandlers() {
 
-    // ===== /owner command =====
-    bot.onText(/\/owner/, (msg) => {
-        if (!isOwner(msg.from.id)) return;
-        if (isOwnerLoggedIn()) {
-            return safeSend(OWNER_ID, "Already logged in! Use Owner Panel buttons.", { reply_markup: getOwnerMenu() });
-        }
-        ownerState[OWNER_ID] = { action: "login" };
-        safeSend(OWNER_ID, "Enter owner password:");
-    });
-
-    // ===== /start =====
-    bot.onText(/\/start/, (msg) => {
-        const userId = msg.from.id;
-        initUser(userId);
-        const status = hasAccess(userId) ? "ACTIVE - " + daysLeft(userId) + " days left" : "NO ACCESS";
-        safeSend(msg.chat.id,
+    // /start
+    bot.onText(/\/start/, msg => {
+        const id = msg.from.id;
+        initUser(id);
+        const status = hasAccess(id) ? "✅ ACTIVE — " + daysLeft(id) + " days left" : "❌ NO ACCESS";
+        send(msg.chat.id,
             "👑 AR-LOTTERY PREDICTION BOT\n\n" +
             "📌 Status  : " + status + "\n" +
-            "🆔 Your ID : " + userId + "\n" +
+            "🆔 Your ID : " + id + "\n" +
             "📩 Contact : " + ADMIN_HANDLE + "\n\n" +
-            "🔑 Have a key? Type: /key YOURCODE",
-            { reply_markup: getMenu(userId) }
+            "🔑 Have a key? Type:\n/key YOURCODE",
+            { reply_markup: userMenu(id) }
         );
     });
 
-    // ===== /key CODE =====
+    // /key CODE
     bot.onText(/\/key (.+)/, (msg, match) => {
-        const userId  = msg.from.id;
-        const keyCode = match[1].trim();
-        initUser(userId);
-        const result = activateKey(userId, keyCode);
-        if (result.ok) {
-            safeSend(msg.chat.id,
+        const id  = msg.from.id;
+        const res = activateKey(id, match[1].trim());
+        initUser(id);
+        if (res.ok) {
+            send(msg.chat.id,
                 "🎊 KEY ACTIVATED!\n\n" +
-                "⏳ Duration : " + result.days + " days\n" +
-                "📅 Expires  : " + result.expiry + "\n\n" +
-                "👇 Tap Start Prediction to begin!",
-                { reply_markup: getMenu(userId) }
+                "⏳ Duration : " + res.days + " days\n" +
+                "📅 Expires  : " + res.expiry + "\n\n" +
+                "👇 Tap Start Prediction!",
+                { reply_markup: userMenu(id) }
             );
-            safeSend(OWNER_ID, "Key Activated!\nUser: " + userId + "\nKey: " + keyCode + "\nDays: " + result.days);
-            // Also notify all logged-in admins
-            Object.keys(adminLoggedIn).forEach(adminId => {
-                if (adminLoggedIn[adminId]) {
-                    safeSend(parseInt(adminId), "Key Activated!\nUser: " + userId + "\nKey: " + keyCode + "\nDays: " + result.days);
-                }
+            send(OWNER_ID, "🔔 Key used!\nUser: " + id + "\nDays: " + res.days);
+            Object.entries(adminLoggedIn).forEach(([aid, on]) => {
+                if (on) send(parseInt(aid), "🔔 Key used!\nUser: " + id + "\nDays: " + res.days);
             });
         } else {
-            safeSend(msg.chat.id, result.reason);
+            send(msg.chat.id, res.msg);
         }
     });
 
-    // ===== /adminlogin PASSWORD (for admins) =====
+    // /owner
+    bot.onText(/\/owner/, msg => {
+        if (msg.from.id !== OWNER_ID) return;
+        if (ownerLoggedIn) return send(OWNER_ID, "Already logged in!", { reply_markup: ownerMenu });
+        ownerState = { action:"login" };
+        send(OWNER_ID, "🔐 Enter owner password:");
+    });
+
+    // /adminlogin PASSWORD
     bot.onText(/\/adminlogin (.+)/, (msg, match) => {
-        const userId = msg.from.id;
-        if (!isAdmin(userId)) return safeSend(userId, "You are not an admin.");
-        const entered = match[1].trim();
-        if (entered === adminPasswords[userId]) {
-            adminLoggedIn[userId] = true;
-            safeSend(userId, "Admin Login Success!\n\nUse the Admin Panel buttons.", { reply_markup: getAdminMenu() });
+        const id   = msg.from.id;
+        const pass = match[1].trim();
+        if (!isAdmin(id)) return send(id, "You are not an admin.");
+        if (pass === adminPasswords[id]) {
+            adminLoggedIn[id] = true;
+            send(id, "✅ Admin Login Success!\nUse 👑 Admin Panel button.", { reply_markup: userMenu(id) });
         } else {
-            safeSend(userId, "Wrong password!");
+            send(id, "❌ Wrong password!");
         }
     });
 
-    // ===== Main message handler =====
-    bot.on("message", async (msg) => {
-        const userId = msg.from.id;
-        const text   = msg.text;
+    // Main message handler
+    bot.on("message", async msg => {
+        const id   = msg.from.id;
+        const text = msg.text;
         if (!text || text.startsWith("/")) return;
-        initUser(userId);
+        initUser(id);
 
-        // ══════════════════════════════
-        // OWNER STATE MACHINE
-        // ══════════════════════════════
-        if (isOwner(userId) && ownerState[OWNER_ID]) {
-            const state = ownerState[OWNER_ID];
+        // ═══════════════════════════════════════
+        // OWNER STATE (waiting for text input)
+        // ═══════════════════════════════════════
+        if (id === OWNER_ID && ownerState) {
+            const s = ownerState;
 
-            // Owner menu buttons always work even inside state
-            const ownerMenuButtons = ["👥 All Users","👮 All Admins","👤 Add Admin","🗑 Remove Admin","🔑 Generate Key","📋 All Keys","🟢 Add User","🔴 Remove User","🔐 Set Token","🚪 Owner Logout"];
-            
+            // Always allow logout button
             if (text === "🚪 Owner Logout") {
-                ownerLoggedIn = false;
-                delete ownerState[OWNER_ID];
-                return safeSend(OWNER_ID, "Owner logged out.", { reply_markup: getMenu(userId) });
+                ownerLoggedIn = false; ownerState = null;
+                return send(OWNER_ID, "🔒 Owner logged out.", { reply_markup: userMenu(id) });
             }
 
-            // If a menu button pressed while in state — cancel state, handle as button
-            if (ownerMenuButtons.includes(text) && state.action !== "login") {
-                delete ownerState[OWNER_ID];
-                // fall through to menu button handlers below
-            }
-
-            // Login
-            else if (state.action === "login") {
+            // LOGIN
+            if (s.action === "login") {
                 if (text === OWNER_PASS) {
-                    ownerLoggedIn = true;
-                    delete ownerState[OWNER_ID];
-                    return safeSend(OWNER_ID, "👑 Owner Login Success! Welcome Boss.", { reply_markup: getOwnerMenu() });
+                    ownerLoggedIn = true; ownerState = null;
+                    return send(OWNER_ID, "👑 Owner Login Success! Welcome Boss.", { reply_markup: ownerMenu });
                 } else {
-                    return safeSend(OWNER_ID, "Wrong password!");
+                    return send(OWNER_ID, "❌ Wrong password!");
                 }
             }
 
-            // Add Admin - step 1: get ID
-            else if (ownerState[OWNER_ID] && state.action === "addadmin") {
-                if (!state.adminId) {
-                    const id = parseInt(text.trim());
-                    if (isNaN(id)) return safeSend(OWNER_ID, "Invalid ID. Send valid user ID:");
-                    state.adminId = id;
-                    return safeSend(OWNER_ID, "ID: " + id + "\nNow set a password for this admin:");
+            // If owner presses a menu button while in state — cancel state, handle below
+            const ownerBtns = ["👥 All Users","👮 All Admins","👤 Add Admin","🗑 Remove Admin","🔑 Generate Key","📋 All Keys","🟢 Add User","🔴 Remove User","🔐 Set Token","🚪 Owner Logout"];
+            if (ownerBtns.includes(text)) {
+                ownerState = null; // cancel current state, fall through
+            }
+
+            // ADD ADMIN
+            else if (s.action === "addadmin") {
+                if (!s.step2) {
+                    const tid = parseInt(text);
+                    if (isNaN(tid)) return send(OWNER_ID, "❌ Invalid ID. Send valid user ID:");
+                    ownerState = { action:"addadmin", step2:true, tid };
+                    return send(OWNER_ID, "ID: " + tid + "\nNow set a password (min 6 chars):");
                 } else {
-                    const pass = text.trim();
-                    const newAdminId = state.adminId;
-                    // Validate password strength
-                    if (pass.length < 6) {
-                        state.adminId = newAdminId; // keep state
-                        return safeSend(OWNER_ID, "Password too short! Min 6 characters. Set a stronger password:");
-                    }
-                    adminPasswords[newAdminId] = pass;
-                    adminLoggedIn[newAdminId]  = false;
-                    delete ownerState[OWNER_ID];
-                    safeSend(OWNER_ID,
-                        "Admin added!\nID: " + newAdminId + "\nPassword: " + pass + "\n\nTell them:\n1. Open bot\n2. Type: /adminlogin " + pass + "\n3. Use Admin Panel button",
-                        { reply_markup: getOwnerMenu() }
-                    );
-                    // Send admin their credentials + make bot show Admin Panel button
-                    safeSend(newAdminId,
-                        "You have been added as Admin!\n\nYour password: " + pass + "\n\nLogin: /adminlogin " + pass + "\n\nAfter login, Admin Panel button will appear at bottom."
-                    );
+                    if (text.length < 6) return send(OWNER_ID, "❌ Min 6 chars! Try again:");
+                    adminPasswords[s.tid] = text;
+                    adminLoggedIn[s.tid]  = false;
+                    ownerState = null;
+                    send(OWNER_ID, "✅ Admin added!\nID: " + s.tid + "\nPassword: " + text + "\n\nTell them:\n/adminlogin " + text, { reply_markup: ownerMenu });
+                    send(s.tid, "🎉 You are now an Admin!\n\nLogin: /adminlogin " + text + "\nThen use 👑 Admin Panel button.");
                     return;
                 }
             }
 
-            // Remove Admin
-            else if (ownerState[OWNER_ID] && state.action === "removeadmin") {
-                const id = parseInt(text.trim());
-                if (isNaN(id)) return safeSend(OWNER_ID, "Invalid ID:");
-                if (!adminPasswords[id]) {
-                    delete ownerState[OWNER_ID];
-                    return safeSend(OWNER_ID, "This ID is not an admin.", { reply_markup: getOwnerMenu() });
-                }
-                delete adminPasswords[id];
-                delete adminLoggedIn[id];
-                delete ownerState[OWNER_ID];
-                safeSend(OWNER_ID, "Admin " + id + " removed.", { reply_markup: getOwnerMenu() });
-                safeSend(id, "Your admin access has been removed.");
+            // REMOVE ADMIN
+            else if (s.action === "removeadmin") {
+                const tid = parseInt(text);
+                if (isNaN(tid)) return send(OWNER_ID, "❌ Invalid ID:");
+                if (!adminPasswords[tid]) { ownerState=null; return send(OWNER_ID, "⚠️ Not an admin.", { reply_markup: ownerMenu }); }
+                delete adminPasswords[tid]; delete adminLoggedIn[tid];
+                ownerState = null;
+                send(OWNER_ID, "🚫 Admin " + tid + " removed.", { reply_markup: ownerMenu });
+                send(tid, "🔴 Your admin access was removed.");
                 return;
             }
 
-            // Generate Key
-            else if (ownerState[OWNER_ID] && state.action === "genkey") {
-                const days = parseInt(text.trim());
-                if (isNaN(days) || days < 1) return safeSend(OWNER_ID, "Invalid. Enter number of days:");
+            // GENERATE KEY
+            else if (s.action === "genkey") {
+                const days = parseInt(text);
+                if (isNaN(days)||days<1) return send(OWNER_ID, "❌ Enter valid number of days:");
                 const key = generateKey(days, OWNER_ID);
-                delete ownerState[OWNER_ID];
-                return safeSend(OWNER_ID,
-                    "Key Generated!\n\n" + key + "\n\nValid: " + days + " days\nUser types: /key " + key,
-                    { reply_markup: getOwnerMenu() }
-                );
+                ownerState = null;
+                return send(OWNER_ID, "🔑 Key Generated!\n\n" + key + "\n\nValid: " + days + " days\nUser types: /key " + key, { reply_markup: ownerMenu });
             }
 
-            // Add User
-            else if (ownerState[OWNER_ID] && state.action === "adduser") {
-                if (!state.targetId) {
-                    const id = parseInt(text.trim());
-                    if (isNaN(id)) return safeSend(OWNER_ID, "Invalid ID:");
-                    state.targetId = id;
-                    return safeSend(OWNER_ID, "ID: " + id + "\nHow many days?");
+            // ADD USER
+            else if (s.action === "adduser") {
+                if (!s.step2) {
+                    const tid = parseInt(text);
+                    if (isNaN(tid)) return send(OWNER_ID, "❌ Invalid ID:");
+                    ownerState = { action:"adduser", step2:true, tid };
+                    return send(OWNER_ID, "ID: " + tid + "\nHow many days?");
                 } else {
-                    const days = parseInt(text.trim());
-                    if (isNaN(days) || days < 1) return safeSend(OWNER_ID, "Invalid days:");
-                    const tid = state.targetId;
-                    usersAccess[tid] = Date.now() + days * 86400000;
-                    delete ownerState[OWNER_ID];
-                    safeSend(OWNER_ID, "User " + tid + " activated for " + days + " days.", { reply_markup: getOwnerMenu() });
-                    safeSend(tid, "VIP ACCESS ACTIVATED! " + days + " days.\nTap Start Prediction to begin!");
+                    const days = parseInt(text);
+                    if (isNaN(days)||days<1) return send(OWNER_ID, "❌ Enter valid days:");
+                    usersAccess[s.tid] = Date.now() + days*86400000;
+                    ownerState = null;
+                    send(OWNER_ID, "✅ User " + s.tid + " activated for " + days + " days.", { reply_markup: ownerMenu });
+                    send(s.tid, "🎊 VIP ACCESS ACTIVATED!\n⏳ Duration: " + days + " days\nTap ▶️ Start Prediction!");
                     return;
                 }
             }
 
-            // Remove User
-            else if (ownerState[OWNER_ID] && state.action === "removeuser") {
-                const id = parseInt(text.trim());
-                if (isNaN(id)) return safeSend(OWNER_ID, "Invalid ID:");
-                const was = hasAccess(id);
-                delete usersAccess[id];
-                running[id] = false;
-                delete ownerState[OWNER_ID];
-                safeSend(OWNER_ID, was ? "User " + id + " removed." : "User " + id + " was not active.", { reply_markup: getOwnerMenu() });
-                if (was) safeSend(id, "Your access has been removed. Contact admin.");
+            // REMOVE USER
+            else if (s.action === "removeuser") {
+                const tid = parseInt(text);
+                if (isNaN(tid)) return send(OWNER_ID, "❌ Invalid ID:");
+                const was = hasAccess(tid);
+                delete usersAccess[tid]; running[tid]=false;
+                ownerState = null;
+                send(OWNER_ID, was ? "🚫 User " + tid + " removed." : "⚠️ User " + tid + " was not active.", { reply_markup: ownerMenu });
+                if (was) send(tid, "🔴 Your access was removed. Contact admin.");
                 return;
             }
 
-            // Set Token
-            else if (ownerState[OWNER_ID] && state.action === "settoken") {
-                AUTH_TOKEN = text.trim();
-                delete ownerState[OWNER_ID];
-                return safeSend(OWNER_ID, "Auth token updated!", { reply_markup: getOwnerMenu() });
+            // SET TOKEN
+            else if (s.action === "settoken") {
+                API_HEADERS["Authorization"] = "Bearer " + text.trim();
+                ownerState = null;
+                return send(OWNER_ID, "✅ Token updated!", { reply_markup: ownerMenu });
             }
         }
 
-        // ══════════════════════════════
+        // ═══════════════════════════════════════
         // OWNER MENU BUTTONS
-        // ══════════════════════════════
-        if (isOwner(userId) && isOwnerLoggedIn()) {
-            if (text === "👥 All Users") {
-                return safeSend(OWNER_ID, "Active Users:\n\n" + listActiveUsers());
-            }
-            if (text === "👮 All Admins") {
-                return safeSend(OWNER_ID, "Admins:\n\n" + listAdmins());
-            }
-            if (text === "👤 Add Admin") {
-                ownerState[OWNER_ID] = { action: "addadmin" };
-                return safeSend(OWNER_ID, "Send the User ID to make admin:");
-            }
-            if (text === "🗑 Remove Admin") {
-                ownerState[OWNER_ID] = { action: "removeadmin" };
-                return safeSend(OWNER_ID, "Send the Admin ID to remove:");
-            }
-            if (text === "🔑 Generate Key") {
-                ownerState[OWNER_ID] = { action: "genkey" };
-                return safeSend(OWNER_ID, "How many days should the key be valid?");
-            }
-            if (text === "📋 All Keys") {
-                return safeSend(OWNER_ID, "All Keys:\n\n" + listAllKeys());
-            }
-            if (text === "🟢 Add User") {
-                ownerState[OWNER_ID] = { action: "adduser" };
-                return safeSend(OWNER_ID, "Send the User ID to activate:");
-            }
-            if (text === "🔴 Remove User") {
-                ownerState[OWNER_ID] = { action: "removeuser" };
-                return safeSend(OWNER_ID, "Send the User ID to remove:");
-            }
-            if (text === "🔐 Set Token") {
-                ownerState[OWNER_ID] = { action: "settoken" };
-                return safeSend(OWNER_ID, "Paste the new Auth Token:");
-            }
-            if (text === "🚪 Owner Logout") {
-                ownerLoggedIn = false;
-                return safeSend(OWNER_ID, "Owner logged out.", { reply_markup: getMenu(userId) });
-            }
+        // ═══════════════════════════════════════
+        if (id === OWNER_ID && ownerLoggedIn) {
+            if (text === "👥 All Users")    return send(OWNER_ID, "👥 Active Users:\n\n" + activeUsersList());
+            if (text === "👮 All Admins")   return send(OWNER_ID, "👮 Admins:\n\n" + adminList());
+            if (text === "👤 Add Admin")    { ownerState={action:"addadmin"}; return send(OWNER_ID, "Send the User ID to make admin:"); }
+            if (text === "🗑 Remove Admin") { ownerState={action:"removeadmin"}; return send(OWNER_ID, "Send the Admin ID to remove:"); }
+            if (text === "🔑 Generate Key") { ownerState={action:"genkey"}; return send(OWNER_ID, "How many days should key be valid?"); }
+            if (text === "📋 All Keys")     return send(OWNER_ID, "📋 All Keys:\n\n" + allKeysList());
+            if (text === "🟢 Add User")     { ownerState={action:"adduser"}; return send(OWNER_ID, "Send the User ID to activate:"); }
+            if (text === "🔴 Remove User")  { ownerState={action:"removeuser"}; return send(OWNER_ID, "Send the User ID to remove:"); }
+            if (text === "🔐 Set Token")    { ownerState={action:"settoken"}; return send(OWNER_ID, "Paste the new Auth Token:"); }
+            if (text === "🚪 Owner Logout") { ownerLoggedIn=false; return send(OWNER_ID, "🔒 Logged out.", { reply_markup: userMenu(id) }); }
         }
 
-        // ══════════════════════════════
-        // ADMIN STATE MACHINE
-        // ══════════════════════════════
-        if (isAdmin(userId) && isAdminLoggedIn(userId) && adminStateMap[userId]) {
-            const state = adminStateMap[userId];
+        // ═══════════════════════════════════════
+        // ADMIN STATE (waiting for text input)
+        // ═══════════════════════════════════════
+        if (isAdmin(id) && isAdminIn(id) && adminState[id]) {
+            const s = adminState[id];
+            const adminBtns = ["👥 Active Users","🔑 Generate Key","🟢 Add User","🔴 Remove User","📋 All Keys","🚪 Admin Logout"];
 
             if (text === "🚪 Admin Logout") {
-                adminLoggedIn[userId] = false;
-                delete adminStateMap[userId];
-                return safeSend(userId, "Admin logged out.", { reply_markup: getMenu(userId) });
+                adminLoggedIn[id]=false; delete adminState[id];
+                return send(id, "🔒 Admin logged out.", { reply_markup: userMenu(id) });
             }
 
-            if (state.action === "genkey") {
-                const days = parseInt(text.trim());
-                if (isNaN(days) || days < 1) return safeSend(userId, "Invalid. Enter number of days:");
-                const key = generateKey(days, userId);
-                delete adminStateMap[userId];
-                return safeSend(userId,
-                    "Key Generated!\n\n" + key + "\n\nValid: " + days + " days\nUser types: /key " + key,
-                    { reply_markup: getAdminMenu() }
-                );
+            if (adminBtns.includes(text)) {
+                delete adminState[id]; // cancel state, fall through
             }
 
-            if (state.action === "adduser") {
-                if (!state.targetId) {
-                    const id = parseInt(text.trim());
-                    if (isNaN(id)) return safeSend(userId, "Invalid ID:");
-                    state.targetId = id;
-                    return safeSend(userId, "ID: " + id + "\nHow many days?");
+            else if (s.action === "genkey") {
+                const days = parseInt(text);
+                if (isNaN(days)||days<1) return send(id, "❌ Enter valid days:");
+                const key = generateKey(days, id);
+                delete adminState[id];
+                return send(id, "🔑 Key Generated!\n\n" + key + "\n\nValid: " + days + " days\nUser types: /key " + key, { reply_markup: adminMenu });
+            }
+
+            else if (s.action === "adduser") {
+                if (!s.step2) {
+                    const tid = parseInt(text);
+                    if (isNaN(tid)) return send(id, "❌ Invalid ID:");
+                    adminState[id] = { action:"adduser", step2:true, tid };
+                    return send(id, "ID: " + tid + "\nHow many days?");
                 } else {
-                    const days = parseInt(text.trim());
-                    if (isNaN(days) || days < 1) return safeSend(userId, "Invalid days:");
-                    const tid = state.targetId;
-                    usersAccess[tid] = Date.now() + days * 86400000;
-                    delete adminStateMap[userId];
-                    safeSend(userId, "User " + tid + " activated for " + days + " days.", { reply_markup: getAdminMenu() });
-                    safeSend(tid, "VIP ACCESS ACTIVATED! " + days + " days.\nTap Start Prediction to begin!");
+                    const days = parseInt(text);
+                    if (isNaN(days)||days<1) return send(id, "❌ Enter valid days:");
+                    usersAccess[s.tid] = Date.now() + days*86400000;
+                    delete adminState[id];
+                    send(id, "✅ User " + s.tid + " activated for " + days + " days.", { reply_markup: adminMenu });
+                    send(s.tid, "🎊 VIP ACCESS!\n⏳ " + days + " days\nTap ▶️ Start Prediction!");
                     return;
                 }
             }
 
-            if (state.action === "removeuser") {
-                const id = parseInt(text.trim());
-                if (isNaN(id)) return safeSend(userId, "Invalid ID:");
-                const was = hasAccess(id);
-                delete usersAccess[id];
-                running[id] = false;
-                delete adminStateMap[userId];
-                safeSend(userId, was ? "User " + id + " removed." : "User " + id + " was not active.", { reply_markup: getAdminMenu() });
-                if (was) safeSend(id, "Your access has been removed. Contact admin.");
+            else if (s.action === "removeuser") {
+                const tid = parseInt(text);
+                if (isNaN(tid)) return send(id, "❌ Invalid ID:");
+                const was = hasAccess(tid);
+                delete usersAccess[tid]; running[tid]=false;
+                delete adminState[id];
+                send(id, was ? "🚫 User " + tid + " removed." : "⚠️ Not active.", { reply_markup: adminMenu });
+                if (was) send(tid, "🔴 Access removed. Contact admin.");
                 return;
             }
         }
 
-        // ══════════════════════════════
+        // ═══════════════════════════════════════
         // ADMIN MENU BUTTONS
-        // ══════════════════════════════
-        if (isAdmin(userId) && isAdminLoggedIn(userId)) {
-            if (text === "👥 Active Users") {
-                return safeSend(userId, "Active Users:\n\n" + listActiveUsers());
-            }
-            if (text === "🔑 Generate Key") {
-                adminStateMap[userId] = { action: "genkey" };
-                return safeSend(userId, "How many days should the key be valid?");
-            }
-            if (text === "🟢 Add User") {
-                adminStateMap[userId] = { action: "adduser" };
-                return safeSend(userId, "Send the User ID to activate:");
-            }
-            if (text === "🔴 Remove User") {
-                adminStateMap[userId] = { action: "removeuser" };
-                return safeSend(userId, "Send the User ID to remove:");
-            }
-            if (text === "📋 All Keys") {
-                return safeSend(userId, "All Keys:\n\n" + listAllKeys());
-            }
-            if (text === "🚪 Admin Logout") {
-                adminLoggedIn[userId] = false;
-                return safeSend(userId, "Admin logged out.", { reply_markup: getMenu(userId) });
-            }
+        // ═══════════════════════════════════════
+        if (isAdmin(id) && isAdminIn(id)) {
+            if (text === "👥 Active Users") return send(id, "👥 Active Users:\n\n" + activeUsersList());
+            if (text === "🔑 Generate Key") { adminState[id]={action:"genkey"}; return send(id, "How many days?"); }
+            if (text === "🟢 Add User")     { adminState[id]={action:"adduser"}; return send(id, "Send User ID to activate:"); }
+            if (text === "🔴 Remove User")  { adminState[id]={action:"removeuser"}; return send(id, "Send User ID to remove:"); }
+            if (text === "📋 All Keys")     return send(id, "📋 Keys:\n\n" + allKeysList());
+            if (text === "🚪 Admin Logout") { adminLoggedIn[id]=false; return send(id, "🔒 Logged out.", { reply_markup: userMenu(id) }); }
         }
 
-        // ══════════════════════════════
+        // ═══════════════════════════════════════
+        // ADMIN PANEL BUTTON (shows menu)
+        // ═══════════════════════════════════════
+        if (text === "👑 Admin Panel" && isAdmin(id)) {
+            if (!isAdminIn(id)) return send(id, "🔐 Login first:\n/adminlogin YOUR_PASSWORD");
+            return send(id, "👑 Admin Panel\nChoose action:", { reply_markup: adminMenu });
+        }
+
+        // ═══════════════════════════════════════
         // USER BUTTONS
-        // ══════════════════════════════
+        // ═══════════════════════════════════════
         if (text === "▶️ Start Prediction") {
-            if (!hasAccess(userId)) {
-                return safeSend(msg.chat.id,
-                    "❌ Access Denied!\n\n📩 Contact " + ADMIN_HANDLE + " for key.\n🆔 Your ID: " + userId + "\n\n🔑 Have a key? Type: /key YOURCODE"
+            if (!hasAccess(id)) {
+                return send(msg.chat.id,
+                    "❌ Access Denied!\n\n📩 Contact " + ADMIN_HANDLE + "\n🆔 Your ID: " + id + "\n\n🔑 Have key? Type:\n/key YOURCODE"
                 );
             }
-            if (running[userId]) return safeSend(msg.chat.id, "Already running! Tap Stop Bot first.");
-            running[userId] = true;
-            sentPeriods[userId] = new Set();
-            await safeSend(msg.chat.id, "🚀 PREDICTION ENGINE ACTIVATED!\n⏳ Fetching next period...");
-            runPredict(userId, msg.chat.id);
+            if (running[id]) return send(msg.chat.id, "⚠️ Already running! Tap 🛑 Stop Bot first.");
+            running[id]      = true;
+            sentPeriods[id]  = new Set();
+            await send(msg.chat.id, "🚀 PREDICTION ENGINE ACTIVATED!\n⏳ Fetching next period...");
+            runPredict(id, msg.chat.id);
         }
 
         if (text === "🛑 Stop Bot") {
-            running[userId] = false;
-            safeSend(msg.chat.id, "🛑 Prediction stopped.");
+            running[id] = false;
+            send(msg.chat.id, "🛑 Prediction stopped.");
         }
 
-        if (text === "📊 Result") showStats(msg);
+        if (text === "📊 Result")  showStats(msg.chat.id, id);
 
         if (text === "📩 Contact") {
-            safeSend(msg.chat.id,
-                "📩 Contact Admin\n\n🔗 Handle : " + ADMIN_HANDLE + "\n🆔 Your ID: " + userId + "\n\n💬 Send your ID to admin for key."
-            );
-        }
-
-        // Admin Panel button (shown only to admins)
-        if (text === "👑 Admin Panel" && isAdmin(userId) && !isOwner(userId)) {
-            if (!isAdminLoggedIn(userId)) {
-                return safeSend(userId,
-                    "Admin Login Required!\n\nType: /adminlogin YOUR_PASSWORD"
-                );
-            }
-            return safeSend(userId,
-                "Admin Panel\n\nChoose action:",
-                { reply_markup: getAdminMenu() }
+            send(msg.chat.id,
+                "📩 Contact Admin\n\n🔗 " + ADMIN_HANDLE + "\n🆔 Your ID: " + id + "\n\nSend your ID to admin for key."
             );
         }
     });
 }
 
-// ===== START =====
-createBot();
-console.log("AR-LOTTERY BOT running...");
+// ============================================================
+//  START
+// ============================================================
+startBot();
