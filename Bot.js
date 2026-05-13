@@ -186,33 +186,40 @@ async function safeSticker(chatId, sid) {
 }
 
 // ===== 7. FETCH DATA =====
+// ===== 7. FETCH DATA (UPDATED & FIXED) =====
 async function fetchData(retries = 3) {
     for (let i = 0; i < retries; i++) {
         try {
+            // URL mathiyachu + await add panniyachu
             const res = await axios.get(
-                "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts=" + Date.now(),
+                "https://api.ar-lottery01.com/api/lottery/GetHistoryIssuePage?ts=" + Date.now(),
                 {
                     headers: {
                         "Authorization": "Bearer " + AUTH_TOKEN,
-                        "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                         "Accept": "application/json"
                     },
-                    timeout: 10000
+                    timeout: 15000
                 }
             );
+
+            // Data kulla list irukkannu check panrom
             const list = res.data && res.data.data && res.data.data.list;
             if (list && list.length > 0) return list;
-            if (res.data && (res.data.code === 401 || (res.data.msg && res.data.msg.toLowerCase().includes("token")))) {
-                safeSend(OWNER_ID, "AUTH TOKEN EXPIRED! Use Set Token in Owner Panel.");
+
+            // Token expire aana notification varum
+            if (res.data && (res.data.code === 401 || String(res.data.msg).toLowerCase().includes("token"))) {
+                safeSend(OWNER_ID, "⚠️ AUTH TOKEN EXPIRED! New token update pannunga.");
                 return null;
             }
-        } catch(e) {
-            console.error("Fetch attempt " + (i+1) + " failed:", e.message);
+        } catch (e) {
+            console.error("Fetch attempt " + (i + 1) + " failed:", e.message);
             if (i < retries - 1) await sleep(3000);
         }
     }
     return null;
 }
+
 
 // ===== 8. PREDICTION =====
 function getLevelInfo(lossStreak) {
