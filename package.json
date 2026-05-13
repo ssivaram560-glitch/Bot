@@ -1,0 +1,13 @@
+{
+  "name": "siva-predict-bot",
+  "version": "1.0.0",
+  "description": "Telegram Prediction Bot",
+  "main": "bot.js",
+  "dependencies": {
+    "node-telegram-bot-api": "^0.61.0",
+    "axios": "^1.6.0"
+  },
+  "scripts": {
+    "start": "node bot.js"
+  }
+}
