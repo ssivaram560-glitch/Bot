@@ -146,7 +146,7 @@ function getAdminMenu() {
     return {
         keyboard: [
             ["👥 Active Users", "🔑 Generate Key"],
-            ["➕ Add User", "➖ Remove User"],
+            ["🟢 Add User", "🔴 Remove User"],
             ["📋 All Keys", "🚪 Admin Logout"]
         ],
         resize_keyboard: true
@@ -156,10 +156,10 @@ function getAdminMenu() {
 function getOwnerMenu() {
     return {
         keyboard: [
-            ["👥 All Users", "🛡 All Admins"],
-            ["➕ Add Admin", "➖ Remove Admin"],
+            ["👥 All Users", "👮 All Admins"],
+            ["👤 Add Admin", "🗑 Remove Admin"],
             ["🔑 Generate Key", "📋 All Keys"],
-            ["✅ Add User", "❌ Remove User"],
+            ["🟢 Add User", "🔴 Remove User"],
             ["🔐 Set Token", "🚪 Owner Logout"]
         ],
         resize_keyboard: true
@@ -210,16 +210,43 @@ async function fetchData(retries = 3) {
                 { headers, timeout: 10000, decompress: true, responseType: "arraybuffer" }
             );
 
-            // Content-Type is octet-stream — decode buffer
+            // octet-stream response — try multiple decode methods
             let data;
-            try {
-                const buf = Buffer.from(res.data);
-                data = JSON.parse(buf.toString("utf8"));
-            } catch(e) {
-                try { data = JSON.parse(res.data.toString()); } catch(e2) {
-                    console.error("Parse error:", e2.message);
-                    continue;
-                }
+            const buf = Buffer.from(res.data);
+            
+            // Method 1: Direct UTF-8
+            try { data = JSON.parse(buf.toString("utf8")); } catch(e) {}
+            
+            // Method 2: zlib inflate
+            if (!data) {
+                try {
+                    const zlib = require("zlib");
+                    const inflated = zlib.inflateSync(buf);
+                    data = JSON.parse(inflated.toString("utf8"));
+                } catch(e) {}
+            }
+            
+            // Method 3: zlib inflateRaw
+            if (!data) {
+                try {
+                    const zlib = require("zlib");
+                    const inflated = zlib.inflateRawSync(buf);
+                    data = JSON.parse(inflated.toString("utf8"));
+                } catch(e) {}
+            }
+
+            // Method 4: gunzip
+            if (!data) {
+                try {
+                    const zlib = require("zlib");
+                    const inflated = zlib.gunzipSync(buf);
+                    data = JSON.parse(inflated.toString("utf8"));
+                } catch(e) {}
+            }
+
+            if (!data) {
+                console.error("All decode methods failed. Raw hex:", buf.slice(0,20).toString("hex"));
+                continue;
             }
 
             const list = data && data.data && data.data.list;
@@ -451,14 +478,23 @@ function registerHandlers() {
         if (isOwner(userId) && ownerState[OWNER_ID]) {
             const state = ownerState[OWNER_ID];
 
+            // Owner menu buttons always work even inside state
+            const ownerMenuButtons = ["👥 All Users","👮 All Admins","👤 Add Admin","🗑 Remove Admin","🔑 Generate Key","📋 All Keys","🟢 Add User","🔴 Remove User","🔐 Set Token","🚪 Owner Logout"];
+            
             if (text === "🚪 Owner Logout") {
                 ownerLoggedIn = false;
                 delete ownerState[OWNER_ID];
                 return safeSend(OWNER_ID, "Owner logged out.", { reply_markup: getMenu(userId) });
             }
 
+            // If a menu button pressed while in state — cancel state, handle as button
+            if (ownerMenuButtons.includes(text) && state.action !== "login") {
+                delete ownerState[OWNER_ID];
+                // fall through to menu button handlers below
+            }
+
             // Login
-            if (state.action === "login") {
+            else if (state.action === "login") {
                 if (text === OWNER_PASS) {
                     ownerLoggedIn = true;
                     delete ownerState[OWNER_ID];
@@ -469,7 +505,7 @@ function registerHandlers() {
             }
 
             // Add Admin - step 1: get ID
-            if (state.action === "addadmin") {
+            else if (ownerState[OWNER_ID] && state.action === "addadmin") {
                 if (!state.adminId) {
                     const id = parseInt(text.trim());
                     if (isNaN(id)) return safeSend(OWNER_ID, "Invalid ID. Send valid user ID:");
@@ -499,7 +535,7 @@ function registerHandlers() {
             }
 
             // Remove Admin
-            if (state.action === "removeadmin") {
+            else if (ownerState[OWNER_ID] && state.action === "removeadmin") {
                 const id = parseInt(text.trim());
                 if (isNaN(id)) return safeSend(OWNER_ID, "Invalid ID:");
                 if (!adminPasswords[id]) {
@@ -515,7 +551,7 @@ function registerHandlers() {
             }
 
             // Generate Key
-            if (state.action === "genkey") {
+            else if (ownerState[OWNER_ID] && state.action === "genkey") {
                 const days = parseInt(text.trim());
                 if (isNaN(days) || days < 1) return safeSend(OWNER_ID, "Invalid. Enter number of days:");
                 const key = generateKey(days, OWNER_ID);
@@ -527,7 +563,7 @@ function registerHandlers() {
             }
 
             // Add User
-            if (state.action === "adduser") {
+            else if (ownerState[OWNER_ID] && state.action === "adduser") {
                 if (!state.targetId) {
                     const id = parseInt(text.trim());
                     if (isNaN(id)) return safeSend(OWNER_ID, "Invalid ID:");
@@ -546,7 +582,7 @@ function registerHandlers() {
             }
 
             // Remove User
-            if (state.action === "removeuser") {
+            else if (ownerState[OWNER_ID] && state.action === "removeuser") {
                 const id = parseInt(text.trim());
                 if (isNaN(id)) return safeSend(OWNER_ID, "Invalid ID:");
                 const was = hasAccess(id);
@@ -559,7 +595,7 @@ function registerHandlers() {
             }
 
             // Set Token
-            if (state.action === "settoken") {
+            else if (ownerState[OWNER_ID] && state.action === "settoken") {
                 AUTH_TOKEN = text.trim();
                 delete ownerState[OWNER_ID];
                 return safeSend(OWNER_ID, "Auth token updated!", { reply_markup: getOwnerMenu() });
@@ -573,14 +609,14 @@ function registerHandlers() {
             if (text === "👥 All Users") {
                 return safeSend(OWNER_ID, "Active Users:\n\n" + listActiveUsers());
             }
-            if (text === "🛡 All Admins") {
+            if (text === "👮 All Admins") {
                 return safeSend(OWNER_ID, "Admins:\n\n" + listAdmins());
             }
-            if (text === "➕ Add Admin") {
+            if (text === "👤 Add Admin") {
                 ownerState[OWNER_ID] = { action: "addadmin" };
                 return safeSend(OWNER_ID, "Send the User ID to make admin:");
             }
-            if (text === "➖ Remove Admin") {
+            if (text === "🗑 Remove Admin") {
                 ownerState[OWNER_ID] = { action: "removeadmin" };
                 return safeSend(OWNER_ID, "Send the Admin ID to remove:");
             }
@@ -591,11 +627,11 @@ function registerHandlers() {
             if (text === "📋 All Keys") {
                 return safeSend(OWNER_ID, "All Keys:\n\n" + listAllKeys());
             }
-            if (text === "➕ Add User") {
+            if (text === "🟢 Add User") {
                 ownerState[OWNER_ID] = { action: "adduser" };
                 return safeSend(OWNER_ID, "Send the User ID to activate:");
             }
-            if (text === "➖ Remove User") {
+            if (text === "🔴 Remove User") {
                 ownerState[OWNER_ID] = { action: "removeuser" };
                 return safeSend(OWNER_ID, "Send the User ID to remove:");
             }
@@ -674,11 +710,11 @@ function registerHandlers() {
                 adminStateMap[userId] = { action: "genkey" };
                 return safeSend(userId, "How many days should the key be valid?");
             }
-            if (text === "➕ Add User") {
+            if (text === "🟢 Add User") {
                 adminStateMap[userId] = { action: "adduser" };
                 return safeSend(userId, "Send the User ID to activate:");
             }
-            if (text === "➖ Remove User") {
+            if (text === "🔴 Remove User") {
                 adminStateMap[userId] = { action: "removeuser" };
                 return safeSend(userId, "Send the User ID to remove:");
             }
