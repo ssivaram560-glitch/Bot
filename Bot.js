@@ -132,19 +132,22 @@ function createBot() {
 // ===== 5. KEYBOARDS =====
 function getMenu(userId) {
     const rows = [
-        ["Start Prediction"],
-        ["Result", "Contact"],
-        ["Stop Bot"]
+        ["▶️ Start Prediction"],
+        ["📊 Result", "📩 Contact"],
+        ["🛑 Stop Bot"]
     ];
+    if (isAdmin(userId) && !isOwner(userId)) {
+        rows.push(["👑 Admin Panel"]);
+    }
     return { keyboard: rows, resize_keyboard: true };
 }
 
 function getAdminMenu() {
     return {
         keyboard: [
-            ["Active Users", "Generate Key"],
-            ["Add User", "Remove User"],
-            ["All Keys", "Admin Logout"]
+            ["👥 Active Users", "🔑 Generate Key"],
+            ["➕ Add User", "➖ Remove User"],
+            ["📋 All Keys", "🚪 Admin Logout"]
         ],
         resize_keyboard: true
     };
@@ -153,11 +156,11 @@ function getAdminMenu() {
 function getOwnerMenu() {
     return {
         keyboard: [
-            ["All Users", "All Admins"],
-            ["Add Admin", "Remove Admin"],
-            ["Generate Key", "All Keys"],
-            ["Add User", "Remove User"],
-            ["Set Token", "Owner Logout"]
+            ["👥 All Users", "🛡 All Admins"],
+            ["➕ Add Admin", "➖ Remove Admin"],
+            ["🔑 Generate Key", "📋 All Keys"],
+            ["✅ Add User", "❌ Remove User"],
+            ["🔐 Set Token", "🚪 Owner Logout"]
         ],
         resize_keyboard: true
     };
@@ -189,23 +192,40 @@ async function safeSticker(chatId, sid) {
 async function fetchData(retries = 3) {
     for (let i = 0; i < retries; i++) {
         try {
+            // No token needed — works without auth
+            const headers = {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+                "Origin": "https://bdgwinseo.com",
+                "Referer": "https://bdgwinseo.com/",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "cross-site"
+            };
+
             const res = await axios.get(
                 "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json?ts=" + Date.now(),
-                {
-                    headers: {
-                        "Authorization": "Bearer " + AUTH_TOKEN,
-                        "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36",
-                        "Accept": "application/json"
-                    },
-                    timeout: 10000
-                }
+                { headers, timeout: 10000, decompress: true, responseType: "arraybuffer" }
             );
-            const list = res.data && res.data.data && res.data.data.list;
-            if (list && list.length > 0) return list;
-            if (res.data && (res.data.code === 401 || (res.data.msg && res.data.msg.toLowerCase().includes("token")))) {
-                safeSend(OWNER_ID, "AUTH TOKEN EXPIRED! Use Set Token in Owner Panel.");
-                return null;
+
+            // Content-Type is octet-stream — decode buffer
+            let data;
+            try {
+                const buf = Buffer.from(res.data);
+                data = JSON.parse(buf.toString("utf8"));
+            } catch(e) {
+                try { data = JSON.parse(res.data.toString()); } catch(e2) {
+                    console.error("Parse error:", e2.message);
+                    continue;
+                }
             }
+
+            const list = data && data.data && data.data.list;
+            if (list && list.length > 0) return list;
+
+            console.log("API response:", JSON.stringify(data).slice(0, 300));
         } catch(e) {
             console.error("Fetch attempt " + (i+1) + " failed:", e.message);
             if (i < retries - 1) await sleep(3000);
@@ -252,7 +272,7 @@ async function runPredict(userId, chatId) {
 
     const list = await fetchData();
     if (!list) {
-        await safeSend(chatId, "API error, retrying in 10s...");
+        await safeSend(chatId, "⚠️ API error, retrying in 10s...");
         return setTimeout(() => runPredict(userId, chatId), 10000);
     }
 
@@ -270,18 +290,17 @@ async function runPredict(userId, chatId) {
 
     const pred = predict(list, stats[userId]);
     const lvl  = getLevelInfo(stats[userId].lossStreak);
-    const arrow = pred === "BIG" ? "[BIG]" : "[SMALL]";
-
+    const emoji = pred === "BIG" ? "🔴" : "🔵";
+    const arrow = pred === "BIG" ? "BIG" : "SMALL";
     const msg = (
-        "================================\n" +
-        "   AR-LOTTERY SIGNAL\n" +
-        "================================\n" +
-        "Period : " + nextPeriod + "\n" +
-        "Predict: " + arrow + "\n" +
-        "Signal : " + lvl.label + "\n" +
-        "Level  : " + lvl.stars + "\n" +
-        "================================\n" +
-        "Place your bet NOW!"
+        "📊 AR-LOTTERY SIGNAL\n" +
+        "〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n" +
+        "📅 Period : " + nextPeriod + "\n" +
+        "🎯 Predict: " + emoji + " " + arrow + "\n" +
+        "📈 Signal : " + lvl.label + "\n" +
+        "⭐ Level  : " + lvl.stars + "\n" +
+        "〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n" +
+        "⚡ Place your bet NOW!"
     );
 
     await safeSend(chatId, msg, {
@@ -300,7 +319,7 @@ async function checkResult(userId, chatId, targetPeriod, predicted) {
         if (!running[userId]) return clearInterval(iv);
         if (++attempts > 18) {
             clearInterval(iv);
-            await safeSend(chatId, "Result timeout - moving to next period.");
+            await safeSend(chatId, "⏱ Result timeout - moving to next period.");
             setTimeout(() => { if (running[userId]) runPredict(userId, chatId); }, 3000);
             return;
         }
@@ -319,13 +338,13 @@ async function checkResult(userId, chatId, targetPeriod, predicted) {
         if (win) {
             s.win++; s.winStreak++; s.lossStreak = 0;
             if (s.winStreak > s.maxWinStreak) s.maxWinStreak = s.winStreak;
-            await safeSend(chatId, "WIN!\nNumber: " + actualNum + " -> " + actual + "\nWin Streak: " + s.winStreak);
+            await safeSend(chatId, "✅ WIN! 🎉\n🔢 Number: " + actualNum + " ➡️ " + actual + "\n🔥 Win Streak: " + s.winStreak + "\n💰 Keep Betting!");
             await safeSticker(chatId, WIN_STICKER);
         } else {
             s.loss++; s.lossStreak++; s.winStreak = 0;
             if (s.lossStreak > s.maxLossStreak) s.maxLossStreak = s.lossStreak;
             const next = getLevelInfo(s.lossStreak);
-            await safeSend(chatId, "LOSS\nNumber: " + actualNum + " -> " + actual + "\nNext Signal: " + next.label + " " + next.stars);
+            await safeSend(chatId, "❌ LOSS\n🔢 Number: " + actualNum + " ➡️ " + actual + "\n⚠️ Next Signal: " + next.label + " " + next.stars + "\n💪 Stay Strong!");
             await safeSticker(chatId, LOSS_STICKER);
         }
         setTimeout(() => { if (running[userId]) runPredict(userId, chatId); }, 8000);
@@ -339,15 +358,16 @@ function showStats(msg) {
     const fill = d.total ? Math.round(d.win / d.total * 10) : 0;
     const bar  = "W".repeat(fill) + "L".repeat(10 - fill);
     safeSend(msg.chat.id,
-        "=== PERFORMANCE REPORT ===\n" +
-        "Total    : " + d.total + "\n" +
-        "Wins     : " + d.win + "\n" +
-        "Losses   : " + d.loss + "\n" +
-        "Accuracy : " + rate + "%\n" +
+        "📊 PERFORMANCE REPORT\n" +
+        "〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n" +
+        "🔮 Total    : " + d.total + "\n" +
+        "✅ Wins     : " + d.win + "\n" +
+        "❌ Losses   : " + d.loss + "\n" +
+        "📈 Accuracy : " + rate + "%\n" +
         "[" + bar + "]\n" +
-        "==========================\n" +
-        "Best Win Streak  : " + d.maxWinStreak + "\n" +
-        "Worst Loss Streak: " + d.maxLossStreak
+        "〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n" +
+        "🔥 Best Win Streak  : " + d.maxWinStreak + "\n" +
+        "💀 Worst Loss Streak: " + d.maxLossStreak
     );
 }
 
@@ -370,11 +390,11 @@ function registerHandlers() {
         initUser(userId);
         const status = hasAccess(userId) ? "ACTIVE - " + daysLeft(userId) + " days left" : "NO ACCESS";
         safeSend(msg.chat.id,
-            "AR-LOTTERY PREDICTION BOT\n\n" +
-            "Status  : " + status + "\n" +
-            "Your ID : " + userId + "\n" +
-            "Contact : " + ADMIN_HANDLE + "\n\n" +
-            "Have a key? Type: /key YOURCODE",
+            "👑 AR-LOTTERY PREDICTION BOT\n\n" +
+            "📌 Status  : " + status + "\n" +
+            "🆔 Your ID : " + userId + "\n" +
+            "📩 Contact : " + ADMIN_HANDLE + "\n\n" +
+            "🔑 Have a key? Type: /key YOURCODE",
             { reply_markup: getMenu(userId) }
         );
     });
@@ -387,10 +407,10 @@ function registerHandlers() {
         const result = activateKey(userId, keyCode);
         if (result.ok) {
             safeSend(msg.chat.id,
-                "KEY ACTIVATED!\n\n" +
-                "Duration : " + result.days + " days\n" +
-                "Expires  : " + result.expiry + "\n\n" +
-                "Tap Start Prediction to begin!",
+                "🎊 KEY ACTIVATED!\n\n" +
+                "⏳ Duration : " + result.days + " days\n" +
+                "📅 Expires  : " + result.expiry + "\n\n" +
+                "👇 Tap Start Prediction to begin!",
                 { reply_markup: getMenu(userId) }
             );
             safeSend(OWNER_ID, "Key Activated!\nUser: " + userId + "\nKey: " + keyCode + "\nDays: " + result.days);
@@ -431,7 +451,7 @@ function registerHandlers() {
         if (isOwner(userId) && ownerState[OWNER_ID]) {
             const state = ownerState[OWNER_ID];
 
-            if (text === "Owner Logout") {
+            if (text === "🚪 Owner Logout") {
                 ownerLoggedIn = false;
                 delete ownerState[OWNER_ID];
                 return safeSend(OWNER_ID, "Owner logged out.", { reply_markup: getMenu(userId) });
@@ -442,7 +462,7 @@ function registerHandlers() {
                 if (text === OWNER_PASS) {
                     ownerLoggedIn = true;
                     delete ownerState[OWNER_ID];
-                    return safeSend(OWNER_ID, "Owner Login Success! Welcome Boss.", { reply_markup: getOwnerMenu() });
+                    return safeSend(OWNER_ID, "👑 Owner Login Success! Welcome Boss.", { reply_markup: getOwnerMenu() });
                 } else {
                     return safeSend(OWNER_ID, "Wrong password!");
                 }
@@ -458,11 +478,22 @@ function registerHandlers() {
                 } else {
                     const pass = text.trim();
                     const newAdminId = state.adminId;
+                    // Validate password strength
+                    if (pass.length < 6) {
+                        state.adminId = newAdminId; // keep state
+                        return safeSend(OWNER_ID, "Password too short! Min 6 characters. Set a stronger password:");
+                    }
                     adminPasswords[newAdminId] = pass;
                     adminLoggedIn[newAdminId]  = false;
                     delete ownerState[OWNER_ID];
-                    safeSend(OWNER_ID, "Admin added!\nID: " + newAdminId + "\nPassword: " + pass + "\nTell them to use /adminlogin " + pass, { reply_markup: getOwnerMenu() });
-                    safeSend(newAdminId, "You have been added as Admin!\n\nLogin with: /adminlogin " + pass);
+                    safeSend(OWNER_ID,
+                        "Admin added!\nID: " + newAdminId + "\nPassword: " + pass + "\n\nTell them:\n1. Open bot\n2. Type: /adminlogin " + pass + "\n3. Use Admin Panel button",
+                        { reply_markup: getOwnerMenu() }
+                    );
+                    // Send admin their credentials + make bot show Admin Panel button
+                    safeSend(newAdminId,
+                        "You have been added as Admin!\n\nYour password: " + pass + "\n\nLogin: /adminlogin " + pass + "\n\nAfter login, Admin Panel button will appear at bottom."
+                    );
                     return;
                 }
             }
@@ -539,40 +570,40 @@ function registerHandlers() {
         // OWNER MENU BUTTONS
         // ══════════════════════════════
         if (isOwner(userId) && isOwnerLoggedIn()) {
-            if (text === "All Users") {
+            if (text === "👥 All Users") {
                 return safeSend(OWNER_ID, "Active Users:\n\n" + listActiveUsers());
             }
-            if (text === "All Admins") {
+            if (text === "🛡 All Admins") {
                 return safeSend(OWNER_ID, "Admins:\n\n" + listAdmins());
             }
-            if (text === "Add Admin") {
+            if (text === "➕ Add Admin") {
                 ownerState[OWNER_ID] = { action: "addadmin" };
                 return safeSend(OWNER_ID, "Send the User ID to make admin:");
             }
-            if (text === "Remove Admin") {
+            if (text === "➖ Remove Admin") {
                 ownerState[OWNER_ID] = { action: "removeadmin" };
                 return safeSend(OWNER_ID, "Send the Admin ID to remove:");
             }
-            if (text === "Generate Key") {
+            if (text === "🔑 Generate Key") {
                 ownerState[OWNER_ID] = { action: "genkey" };
                 return safeSend(OWNER_ID, "How many days should the key be valid?");
             }
-            if (text === "All Keys") {
+            if (text === "📋 All Keys") {
                 return safeSend(OWNER_ID, "All Keys:\n\n" + listAllKeys());
             }
-            if (text === "Add User") {
+            if (text === "➕ Add User") {
                 ownerState[OWNER_ID] = { action: "adduser" };
                 return safeSend(OWNER_ID, "Send the User ID to activate:");
             }
-            if (text === "Remove User") {
+            if (text === "➖ Remove User") {
                 ownerState[OWNER_ID] = { action: "removeuser" };
                 return safeSend(OWNER_ID, "Send the User ID to remove:");
             }
-            if (text === "Set Token") {
+            if (text === "🔐 Set Token") {
                 ownerState[OWNER_ID] = { action: "settoken" };
                 return safeSend(OWNER_ID, "Paste the new Auth Token:");
             }
-            if (text === "Owner Logout") {
+            if (text === "🚪 Owner Logout") {
                 ownerLoggedIn = false;
                 return safeSend(OWNER_ID, "Owner logged out.", { reply_markup: getMenu(userId) });
             }
@@ -584,7 +615,7 @@ function registerHandlers() {
         if (isAdmin(userId) && isAdminLoggedIn(userId) && adminStateMap[userId]) {
             const state = adminStateMap[userId];
 
-            if (text === "Admin Logout") {
+            if (text === "🚪 Admin Logout") {
                 adminLoggedIn[userId] = false;
                 delete adminStateMap[userId];
                 return safeSend(userId, "Admin logged out.", { reply_markup: getMenu(userId) });
@@ -636,25 +667,25 @@ function registerHandlers() {
         // ADMIN MENU BUTTONS
         // ══════════════════════════════
         if (isAdmin(userId) && isAdminLoggedIn(userId)) {
-            if (text === "Active Users") {
+            if (text === "👥 Active Users") {
                 return safeSend(userId, "Active Users:\n\n" + listActiveUsers());
             }
-            if (text === "Generate Key") {
+            if (text === "🔑 Generate Key") {
                 adminStateMap[userId] = { action: "genkey" };
                 return safeSend(userId, "How many days should the key be valid?");
             }
-            if (text === "Add User") {
+            if (text === "➕ Add User") {
                 adminStateMap[userId] = { action: "adduser" };
                 return safeSend(userId, "Send the User ID to activate:");
             }
-            if (text === "Remove User") {
+            if (text === "➖ Remove User") {
                 adminStateMap[userId] = { action: "removeuser" };
                 return safeSend(userId, "Send the User ID to remove:");
             }
-            if (text === "All Keys") {
+            if (text === "📋 All Keys") {
                 return safeSend(userId, "All Keys:\n\n" + listAllKeys());
             }
-            if (text === "Admin Logout") {
+            if (text === "🚪 Admin Logout") {
                 adminLoggedIn[userId] = false;
                 return safeSend(userId, "Admin logged out.", { reply_markup: getMenu(userId) });
             }
@@ -663,29 +694,42 @@ function registerHandlers() {
         // ══════════════════════════════
         // USER BUTTONS
         // ══════════════════════════════
-        if (text === "Start Prediction") {
+        if (text === "▶️ Start Prediction") {
             if (!hasAccess(userId)) {
                 return safeSend(msg.chat.id,
-                    "Access Denied!\n\nContact " + ADMIN_HANDLE + " for key.\nYour ID: " + userId + "\n\nHave a key? Type: /key YOURCODE"
+                    "❌ Access Denied!\n\n📩 Contact " + ADMIN_HANDLE + " for key.\n🆔 Your ID: " + userId + "\n\n🔑 Have a key? Type: /key YOURCODE"
                 );
             }
             if (running[userId]) return safeSend(msg.chat.id, "Already running! Tap Stop Bot first.");
             running[userId] = true;
             sentPeriods[userId] = new Set();
-            await safeSend(msg.chat.id, "PREDICTION ENGINE ACTIVATED!\nFetching next period...");
+            await safeSend(msg.chat.id, "🚀 PREDICTION ENGINE ACTIVATED!\n⏳ Fetching next period...");
             runPredict(userId, msg.chat.id);
         }
 
-        if (text === "Stop Bot") {
+        if (text === "🛑 Stop Bot") {
             running[userId] = false;
-            safeSend(msg.chat.id, "Prediction stopped.");
+            safeSend(msg.chat.id, "🛑 Prediction stopped.");
         }
 
-        if (text === "Result") showStats(msg);
+        if (text === "📊 Result") showStats(msg);
 
-        if (text === "Contact") {
+        if (text === "📩 Contact") {
             safeSend(msg.chat.id,
-                "Contact Admin\n\nHandle : " + ADMIN_HANDLE + "\nYour ID: " + userId + "\n\nSend your ID to admin for key."
+                "📩 Contact Admin\n\n🔗 Handle : " + ADMIN_HANDLE + "\n🆔 Your ID: " + userId + "\n\n💬 Send your ID to admin for key."
+            );
+        }
+
+        // Admin Panel button (shown only to admins)
+        if (text === "👑 Admin Panel" && isAdmin(userId) && !isOwner(userId)) {
+            if (!isAdminLoggedIn(userId)) {
+                return safeSend(userId,
+                    "Admin Login Required!\n\nType: /adminlogin YOUR_PASSWORD"
+                );
+            }
+            return safeSend(userId,
+                "Admin Panel\n\nChoose action:",
+                { reply_markup: getAdminMenu() }
             );
         }
     });
